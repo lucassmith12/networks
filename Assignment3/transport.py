@@ -51,12 +51,13 @@ class TransportSocket:
         self.wait_cond = threading.Condition(self.recv_lock)
 
         self.death_lock = threading.Lock()
+        self.death_cond = threading.Condition(self.death_lock)
         self.dying = False
         self.thread = None
 
         self.window = {
-            "last_ack": 0,            # The next seq we expect from peer (used for receiving data)
-            "next_seq_expected": 0,   # The highest ack we've received for *our* transmitted data
+            "last_ack": 0,            # The next seq we expect from peer (used for receiving data), aka last ack we sent
+            "next_seq_expected": 0,   # The highest ack we've received for *our* transmitted data, aka last ack we received
             "recv_buf": b"",          # Received data buffer
             "recv_len": 0,            # How many bytes are in recv_buf
             "next_seq_to_send": 0,    # The sequence number for the next packet we send
@@ -65,6 +66,9 @@ class TransportSocket:
         self.sock_type = None
         self.conn = None
         self.my_port = None
+
+        self.timeout = 3
+        self.closing_time = None
 
     def socket(self, sock_type, port, server_ip=None):
         """
@@ -97,11 +101,21 @@ class TransportSocket:
         """
         Close the socket and stop the backend thread.
         """
-        self.death_lock.acquire()
-        try:
-            self.dying = True
-        finally:
-            self.death_lock.release()
+
+        # We are now done sending data
+        # We send a FIN to signify this
+        fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG, payload=b'F')
+
+        # If the peer is waiting on us to finish, go into LAST_ACK instead
+        self.window["status"] = "FIN_SENT" if self.window["status"] == "ESTABLISHED" else "LAST_ACK" 
+
+        self.sock_fd.sendto(fin_packet.encode(), self.conn)
+        print(f"[FIN] (seq={fin_packet.seq}, ack={fin_packet.ack})")
+        self.window["next_seq_to_send"] += len(fin_packet.payload)
+
+        with self.death_cond:
+            if self.dying == False:
+                self.death_cond.wait()
 
         if self.thread:
             self.thread.join()
@@ -111,7 +125,7 @@ class TransportSocket:
         else:
             print("Error: Null socket")
             return EXIT_ERROR
-
+        print("Closed Successfully!")
         return EXIT_SUCCESS
 
     def send(self, data):
@@ -175,7 +189,7 @@ class TransportSocket:
         self.window["status"] = "SYN_SENT"
         retries = 0
         while retries < 5:
-            print(f"[SYN] sent (seq={syn_packet.seq}, ack={syn_packet.ack}) .")
+            print(f"[SYN] sent (seq={syn_packet.seq}, ack={syn_packet.ack})")
             self.sock_fd.sendto(syn_packet.encode(), self.conn)
             
             if self.wait_for_ack(syn_packet.seq + len(syn_byte)):
@@ -214,7 +228,7 @@ class TransportSocket:
 
             retries = 0
             while True:
-                print(f"[SEQ] packet (seq={seq_no}, ack={self.window["last_ack"]}, len={payload_len})")
+                print(f"[SENT] packet (seq={seq_no}, ack={self.window["last_ack"]}, len={payload_len})")
                 self.sock_fd.sendto(segment.encode(), self.conn)
                 time.sleep(0.1)
                 if self.wait_for_ack(ack_goal):
@@ -227,7 +241,8 @@ class TransportSocket:
 
             offset += payload_len
 
-    
+        
+
 
     def wait_for_ack(self, ack_goal):
         """
@@ -252,8 +267,19 @@ class TransportSocket:
         Backend loop to handle receiving data and sending acknowledgments.
         All incoming packets are read in this thread only, to avoid concurrency conflicts.
         """
-        while not self.dying:
+        while self.window["status"] != "CLOSED":
             try:
+                if self.window["status"] == "TIME_WAIT" or self.window["status"] == "CLOSE_WAIT":
+                # Initiate shutdown clock if not already done so
+                    if not self.closing_time:
+                        self.closing_time = time.time()
+
+                    # Once clock runs out shut ourselves down
+                    if time.time() - self.closing_time > 2*self.timeout:
+                        self.window["status"] = "CLOSED"
+                        print("Backend Closing...")
+                        continue
+
                 data, addr = self.sock_fd.recvfrom(2048)
                 packet = Packet.decode(data)
 
@@ -269,15 +295,19 @@ class TransportSocket:
                             print(f"[SYN] received (seq={packet.seq}, ack={packet.ack})")
                             self.window["status"] = "SYN_RCVD"
                             
-                            syn_ack_val = packet.seq + len(packet.payload)
+                            self.window["next_seq_to_send"] = syn_ack_val = packet.seq + len(packet.payload)
                             syn_ack_packet = Packet(seq=0, ack=syn_ack_val, flags=SYN_FLAG + ACK_FLAG, payload=b'A')
-                            self.window["last_ack"] = packet.seq
-                            
                             
                             self.sock_fd.sendto(syn_ack_packet.encode(), addr)
                             print(f"[SYN-ACK] sent (seq={syn_ack_packet.seq}, ack={syn_ack_packet.ack})")
-                            # Update last_ack
+                            
+
+                            # Update last ack we sent
                             self.window["last_ack"] = syn_ack_val
+                            # Update last ack we received
+                            self.update_ack(packet)
+                            
+
                             continue
                         
                     case "SYN_SENT":
@@ -285,14 +315,16 @@ class TransportSocket:
                         if packet.flags & (SYN_FLAG + ACK_FLAG) != 0:
                             print(f"[SYN-ACK] received (seq={packet.seq}, ack={packet.ack})")
                             self.update_ack(packet)
-                            self.window["next_seq_expected"] += len(packet.payload)
-                        
+                            self.window["last_ack"] += len(packet.payload)
+
+
                             ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG, payload=b'A')
                             self.sock_fd.sendto(ack_packet.encode(), addr)
 
-                            print("[ACK] sent")
+                            print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
                             print("[ESTABLISHED] Handshake complete!")
                             self.window["status"] = "ESTABLISHED"
+                            continue
                             
                             
                     case "SYN_RCVD":
@@ -301,11 +333,24 @@ class TransportSocket:
                             print("[ESTABLISHED] Handshake complete!")
                             self.window["status"] = "ESTABLISHED"
                             self.update_ack(packet)
+                            continue
                             
                     case "ESTABLISHED":
+                        # If its a FIN packet, ACK it, go into CLOSE_WAIT to finish sending data
+                        if packet.flags & FIN_FLAG != 0:
+                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.ack + len(packet.payload), flags=FIN_FLAG+ACK_FLAG, payload=b'A')
+                            self.window["last_ack"] = ack_val
+                            self.window["next_seq_to_send"] += len(ack_packet.payload)
+                            print(f"[ACKING FIN] (seq={ack_packet.seq}, ack={ack_packet.ack})")                          
+                            self.window["status"] = "CLOSE_WAIT"
+                            print("Entering CLOSE_WAIT")
+
+                            continue
+
+                        
                         # If it's an ACK packet, update our sending side
                         if (packet.flags & ACK_FLAG) != 0:
-                            print(f"[ACK] (seq={packet.seq}, ack={packet.ack}) received")
+                            print(f"[ACKED] (seq={packet.seq}, ack={packet.ack})")
                             self.update_ack(packet)
                             continue
 
@@ -320,6 +365,8 @@ class TransportSocket:
 
                             with self.wait_cond:
                                 self.wait_cond.notify_all()
+                            
+                            print(f"[RCVD] (seq={packet.seq}, ack={packet.ack}, len={len(packet.payload)})")
 
                             # Log the received data
 
@@ -329,19 +376,69 @@ class TransportSocket:
                             self.sock_fd.sendto(ack_packet.encode(), addr)
                             # Update last_ack
                             self.window["last_ack"] = ack_val 
+
+                            print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
+                            continue
+
                         else:
                             # For a real TCP, we need to send duplicate ACK or ignore out-of-order data
                             print(f"Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
+                            continue
+                    
                     case "FIN_SENT":
-                        pass
+                        # If FIN-ACK packet, go into TIME_WAIT
+                        if packet.flags & (ACK_FLAG + FIN_FLAG) !=0:
+                            print(f"[FIN-ACKED] (seq={packet.seq}, ack={packet.ack})")
+                            self.window["status"] = "TIME_WAIT"
+                            print("Entering TIME_WAIT")
+
+                            continue
+                        # If FIN packet, send an ack and go into TIME_WAIT
+                        if packet.flags & FIN_FLAG !=0:
+                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.ack + len(packet.payload), flags=FIN_FLAG+ACK_FLAG, payload=b'A')
+                            self.window["last_ack"] = ack_val
+                            self.window["next_seq_to_send"] += len(ack_packet.payload)
+                            print(f"[ACKING FIN] (seq={ack_packet.seq}, ack={ack_packet.ack})")
+
+                            self.window["status"] = "TIME_WAIT"
+                            print("Entering TIME_WAIT")
+                            continue
+
                     case "CLOSE_WAIT":
-                        pass
+                        # The only thing we should be receiving in CLOSE_WAIT are acks for our packets
+                        if packet.flags & ACK_FLAG != 0:
+                            print(f"[ACKED] (seq={packet.seq}, ack={packet.ack})")
+                            self.update_ack(packet)
+                            continue
+                    
                     case "TIME_WAIT":
-                        pass
+                        # If we get a packet during TIME_WAIT we ack it
+                        print(f"[RCVD] (seq={packet.seq}, ack={packet.ack}, len={len(packet.payload)})")
+                        flags = ACK_FLAG
+                        if packet.flags & FIN_FLAG:
+                            flags += FIN_FLAG
+                        
+                        # Send back an acknowledgment
+                        ack_val = packet.seq + len(packet.payload)
+                        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, payload=b'A')
+                        self.sock_fd.sendto(ack_packet.encode(), addr)
+                        # Update last_ack
+                        self.window["last_ack"] = ack_val 
+                        continue
+                        
                     case "LAST_ACK":
-                        pass
+                        # If received our ack for our last segment close ourself.
+                        if packet.flags & (FIN_FLAG + ACK_FLAG) != 0:
+                            print(f"[FIN-ACKED] (seq={packet.seq}, ack={packet.ack})")
+                            print("[CLOSING]")
+                            self.window["status"] = "CLOSED"
+                            break
+                            
+                    
                     case "CLOSED":
-                        pass
+                        # If we are closed, we must end the backend
+                        break
+                        
                     case _:
                         print(f"Error in status {self.window["status"]}")
                     
@@ -354,7 +451,15 @@ class TransportSocket:
                     print(f"Error in backend: {e}")
                     break
 
+        with self.death_lock:
+            self.dying = True
+            self.death_cond.notify_all()
+
+
     def update_ack(self, packet):
+        """
+        Helper method to quickly update the last ack received and update the send side
+        """
         with self.recv_lock:
             if packet.ack > self.window["next_seq_expected"]:
                 self.window["next_seq_expected"] = packet.ack

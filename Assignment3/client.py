@@ -23,7 +23,7 @@ def client_main():
 
     # Send randomly generated data to the server
     random_data = generate_random_data(128)
-    print(f"[CLIENT] Sending randomly generated data to the server...")
+    print("[CLIENT] Sending randomly generated data to the server...")
     client_socket.send(random_data)
 
     # Receive data from the server
