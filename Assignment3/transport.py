@@ -2,7 +2,7 @@ import socket
 import struct
 import threading
 import time  
-from grading import MSS, DEFAULT_TIMEOUT
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -175,7 +175,7 @@ class TransportSocket:
         while retries < 5:
             print(f"[SYN] sent.")
             self.sock_fd.sendto(syn_packet.encode(), self.conn)
-
+            # delay
             if self.wait_for_ack(syn_packet.seq):
                 print(f"[SYN_ACK] received.")
                 break
