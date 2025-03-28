@@ -296,19 +296,14 @@ class TransportSocket:
                         # If it's a SYN packet, go to SYN_RCVD and send SYN_ACK
                         if packet.flags & SYN_FLAG !=0:
                             print(f"[SYN] received (seq={packet.seq}, ack={packet.ack})")
-                            self.window["status"] = "SYN_RCVD"
-                            
                             self.window["next_seq_to_send"] = syn_ack_val = packet.seq + len(packet.payload)
-                            syn_ack_packet = Packet(seq=0, ack=syn_ack_val, flags=SYN_FLAG + ACK_FLAG, payload=b'A')
-                            
-                            self.sock_fd.sendto(syn_ack_packet.encode(), addr)
-                            print(f"[SYN-ACK] sent (seq={syn_ack_packet.seq}, ack={syn_ack_packet.ack})")
-                            
-
-                            # Update last ack we sent
-                            self.window["last_ack"] = syn_ack_val
+                            self.window["status"] = "SYN_RCVD"
                             # Update last ack we received
                             self.update_ack(packet)
+                            
+                            self.ack_packet(packet, SYN_FLAG + ACK_FLAG, addr)
+                            
+                            
                             
 
                             continue
@@ -459,10 +454,17 @@ class TransportSocket:
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
         self.window["last_ack"] = ack_val
-        if flags & FIN_FLAG !=0:
-            print(f"[ACKING FIN] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")                          
+
+        kind = ""
+        if flags & FIN_FLAG !=0: 
+            kind = "ACKING FIN"
+
+        elif flags & SYN_FLAG != 0:
+            kind = "ACKING SYN"
         else:
-            print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
+            kind = "ACKING"
+            
+        print(f"[{kind}] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
 
 
     
