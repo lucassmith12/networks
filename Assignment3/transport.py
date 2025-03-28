@@ -107,7 +107,10 @@ class TransportSocket:
         fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG, payload=b'F')
 
         # If the peer is waiting on us to finish, go into LAST_ACK instead
-        self.window["status"] = "FIN_SENT" if self.window["status"] == "ESTABLISHED" else "LAST_ACK" 
+        if self.window["status"] == "ESTABLISHED" or self.window["status"] == "SYN_RCVD":
+            self.window["status"] = "FIN_SENT" 
+        else:
+            self.window["status"] = "LAST_ACK" 
 
         self.sock_fd.sendto(fin_packet.encode(), self.conn)
         print(f"[FIN] (seq={fin_packet.seq}, ack={fin_packet.ack})")
@@ -317,7 +320,6 @@ class TransportSocket:
                             self.update_ack(packet)
                             self.window["last_ack"] += len(packet.payload)
 
-
                             ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG, payload=b'A')
                             self.sock_fd.sendto(ack_packet.encode(), addr)
 
@@ -338,10 +340,8 @@ class TransportSocket:
                     case "ESTABLISHED":
                         # If its a FIN packet, ACK it, go into CLOSE_WAIT to finish sending data
                         if packet.flags & FIN_FLAG != 0:
-                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.ack + len(packet.payload), flags=FIN_FLAG+ACK_FLAG, payload=b'A')
-                            self.window["last_ack"] = ack_val
-                            self.window["next_seq_to_send"] += len(ack_packet.payload)
-                            print(f"[ACKING FIN] (seq={ack_packet.seq}, ack={ack_packet.ack})")                          
+                            self.ack_packet(packet, FIN_FLAG+ACK_FLAG, addr)
+                            
                             self.window["status"] = "CLOSE_WAIT"
                             print("Entering CLOSE_WAIT")
 
@@ -369,15 +369,9 @@ class TransportSocket:
                             print(f"[RCVD] (seq={packet.seq}, ack={packet.ack}, len={len(packet.payload)})")
 
                             # Log the received data
+                            self.ack_packet(packet, ACK_FLAG, addr)
+                            
 
-                            # Send back an acknowledgment
-                            ack_val = packet.seq + len(packet.payload)
-                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=ACK_FLAG, payload=b'A')
-                            self.sock_fd.sendto(ack_packet.encode(), addr)
-                            # Update last_ack
-                            self.window["last_ack"] = ack_val 
-
-                            print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
                             continue
 
                         else:
@@ -389,16 +383,14 @@ class TransportSocket:
                         # If FIN-ACK packet, go into TIME_WAIT
                         if packet.flags & (ACK_FLAG + FIN_FLAG) !=0:
                             print(f"[FIN-ACKED] (seq={packet.seq}, ack={packet.ack})")
-                            self.window["status"] = "TIME_WAIT"
                             print("Entering TIME_WAIT")
 
+                            self.window["status"] = "TIME_WAIT"
                             continue
+
                         # If FIN packet, send an ack and go into TIME_WAIT
                         if packet.flags & FIN_FLAG !=0:
-                            ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=packet.ack + len(packet.payload), flags=FIN_FLAG+ACK_FLAG, payload=b'A')
-                            self.window["last_ack"] = ack_val
-                            self.window["next_seq_to_send"] += len(ack_packet.payload)
-                            print(f"[ACKING FIN] (seq={ack_packet.seq}, ack={ack_packet.ack})")
+                            self.ack_packet(packet, FIN_FLAG+ACK_FLAG, addr)
 
                             self.window["status"] = "TIME_WAIT"
                             print("Entering TIME_WAIT")
@@ -418,12 +410,7 @@ class TransportSocket:
                         if packet.flags & FIN_FLAG:
                             flags += FIN_FLAG
                         
-                        # Send back an acknowledgment
-                        ack_val = packet.seq + len(packet.payload)
-                        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, payload=b'A')
-                        self.sock_fd.sendto(ack_packet.encode(), addr)
-                        # Update last_ack
-                        self.window["last_ack"] = ack_val 
+                        self.ack_packet(packet, flags, addr)
                         continue
                         
                     case "LAST_ACK":
@@ -464,5 +451,19 @@ class TransportSocket:
             if packet.ack > self.window["next_seq_expected"]:
                 self.window["next_seq_expected"] = packet.ack
             self.wait_cond.notify_all()
-        
+    
+    def ack_packet(self, packet, flags, addr):
+        # Send back an acknowledgment
+        ack_val = packet.seq + len(packet.payload)
+        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, payload=b'A')
+        self.sock_fd.sendto(ack_packet.encode(), addr)
+        # Update last_ack
+        self.window["last_ack"] = ack_val
+        if flags & FIN_FLAG !=0:
+            print(f"[ACKING FIN] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")                          
+        else:
+            print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
+
+
+    
 
