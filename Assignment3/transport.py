@@ -104,7 +104,7 @@ class TransportSocket:
 
         # We are now done sending data
         # We send a FIN to signify this
-        fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG, payload=b'F')
+        fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG)
 
         # If the peer is waiting on us to finish, go into LAST_ACK instead
         if self.window["status"] == "ESTABLISHED" or self.window["status"] == "SYN_RCVD":
@@ -187,16 +187,14 @@ class TransportSocket:
         """
         Send a syn to initiate TCP handshake
         """
-        syn_byte = b'S'
-        syn_packet = Packet(seq=self.window["next_seq_to_send"], ack = self.window["last_ack"], flags=SYN_FLAG, payload = syn_byte)
+        syn_packet = Packet(seq=self.window["next_seq_to_send"], ack = self.window["last_ack"], flags=SYN_FLAG)
         self.window["status"] = "SYN_SENT"
         retries = 0
         while retries < 5:
             print(f"[SYN] sent (seq={syn_packet.seq}, ack={syn_packet.ack})")
             self.sock_fd.sendto(syn_packet.encode(), self.conn)
             
-            if self.wait_for_ack(syn_packet.seq + len(syn_byte)):
-                self.window["next_seq_to_send"] += len(syn_byte)
+            if self.wait_for_ack(syn_packet.seq):
                 break
             else:
                 retries += 1
@@ -254,7 +252,7 @@ class TransportSocket:
         """
         with self.recv_lock:
             start = time.time()
-            while self.window["next_seq_expected"] < ack_goal:
+            while self.window["status"] != "ESTABLISHED" :
                 elapsed = time.time() - start
                 remaining = DEFAULT_TIMEOUT - elapsed
                 if remaining <= 0 and self.window["status"]:   
@@ -296,7 +294,7 @@ class TransportSocket:
                         # If it's a SYN packet, go to SYN_RCVD and send SYN_ACK
                         if packet.flags & SYN_FLAG !=0:
                             print(f"[SYN] received (seq={packet.seq}, ack={packet.ack})")
-                            self.window["next_seq_to_send"] = syn_ack_val = packet.seq + len(packet.payload)
+                            self.window["next_seq_to_send"] = packet.seq 
                             self.window["status"] = "SYN_RCVD"
                             # Update last ack we received
                             self.update_ack(packet)
@@ -315,7 +313,7 @@ class TransportSocket:
                             self.update_ack(packet)
                             self.window["last_ack"] += len(packet.payload)
 
-                            ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG, payload=b'A')
+                            ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG)
                             self.sock_fd.sendto(ack_packet.encode(), addr)
 
                             print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
@@ -450,7 +448,7 @@ class TransportSocket:
     def ack_packet(self, packet, flags, addr):
         # Send back an acknowledgment
         ack_val = packet.seq + len(packet.payload)
-        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, payload=b'A')
+        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags)
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
         self.window["last_ack"] = ack_val
