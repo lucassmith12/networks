@@ -110,7 +110,7 @@ class TransportSocket:
         # We are now done sending data
         # We send a FIN to signify this
         fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG, window_size=self.get_window())
-
+        print(fin_packet.window_size)
         # If the peer is waiting on us to finish, go into LAST_ACK instead
         if self.window["status"] == "ESTABLISHED" or self.window["status"] == "SYN_RCVD":
             self.window["status"] = "FIN_SENT" 
@@ -219,6 +219,7 @@ class TransportSocket:
             # Check if syn has been sent
             if self.window["status"] == "LISTEN":
                 self.send_syn()
+
             
             payload_len = min(MSS, total_len - offset, MAX_NETWORK_BUFFER-1)
 
@@ -232,10 +233,12 @@ class TransportSocket:
             # We expect an ACK for seq_no + payload_len
             ack_goal = seq_no + payload_len
 
+            if payload_len > self.window["peer_window"]:
+                self.window["peer_window"] += 10
+
             retries = 0
             while True:
-                while payload_len > self.window["peer_window"]:
-                    time.sleep(0.1)
+                 
                  
                 print(f"[SENT] packet (seq={seq_no}, ack={self.window["last_ack"]}, len={payload_len})")
                 self.sock_fd.sendto(segment.encode(), self.conn)
@@ -292,6 +295,9 @@ class TransportSocket:
                 data, addr = self.sock_fd.recvfrom(2048)
                 packet = Packet.decode(data)
                 self.window["peer_window"] = packet.window_size
+                
+                # Reset our time if we get a new packet
+                
 
                 # If no peer is set, establish connection (for listener)
                 if self.conn is None:
@@ -399,6 +405,8 @@ class TransportSocket:
                         if packet.flags & ACK_FLAG != 0:
                             print(f"[ACKED] (seq={packet.seq}, ack={packet.ack})")
                             self.update_ack(packet)
+                            # Update the closing time
+                            self.closing_time = time.time()
                             continue
                     
                     case "TIME_WAIT":
@@ -409,6 +417,8 @@ class TransportSocket:
                             flags += FIN_FLAG
                         
                         self.ack_packet(packet, flags, addr)
+                        # Update the closing time
+                        self.closing_time = time.time()
                         continue
                         
                     case "LAST_ACK":
