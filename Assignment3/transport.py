@@ -61,7 +61,9 @@ class TransportSocket:
             "recv_buf": b"",          # Received data buffer
             "recv_len": 0,            # How many bytes are in recv_buf
             "next_seq_to_send": 0,    # The sequence number for the next packet we send
-            "status": "LISTEN"        # Status in the FSM: in enum ("LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED", "FIN_SENT", "CLOSE_WAIT", "TIME_WAIT", "LAST_ACK", "CLOSED")
+            "status": "LISTEN",        # Status in the FSM: in enum ("LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED", "FIN_SENT", "CLOSE_WAIT", "TIME_WAIT", "LAST_ACK", "CLOSED")
+            "our_window": MAX_NETWORK_BUFFER,
+            "peer_window": MAX_NETWORK_BUFFER
         }
         self.sock_type = None
         self.conn = None
@@ -69,6 +71,7 @@ class TransportSocket:
 
         self.timeout = 3
         self.closing_time = None
+        
 
     def socket(self, sock_type, port, server_ip=None):
         """
@@ -92,6 +95,8 @@ class TransportSocket:
 
         self.my_port = self.sock_fd.getsockname()[1]
 
+        self.window["our_window"] = self.get_window()
+
         # Start the backend thread
         self.thread = threading.Thread(target=self.backend, daemon=True)
         self.thread.start()
@@ -104,7 +109,7 @@ class TransportSocket:
 
         # We are now done sending data
         # We send a FIN to signify this
-        fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG)
+        fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG, window_size=self.get_window())
 
         # If the peer is waiting on us to finish, go into LAST_ACK instead
         if self.window["status"] == "ESTABLISHED" or self.window["status"] == "SYN_RCVD":
@@ -187,7 +192,7 @@ class TransportSocket:
         """
         Send a syn to initiate TCP handshake
         """
-        syn_packet = Packet(seq=self.window["next_seq_to_send"], ack = self.window["last_ack"], flags=SYN_FLAG)
+        syn_packet = Packet(seq=self.window["next_seq_to_send"], ack = self.window["last_ack"], flags=SYN_FLAG, window_size=self.get_window())
         self.window["status"] = "SYN_SENT"
         retries = 0
         while retries < 5:
@@ -215,20 +220,23 @@ class TransportSocket:
             if self.window["status"] == "LISTEN":
                 self.send_syn()
             
-            payload_len = min(MSS, total_len - offset)
+            payload_len = min(MSS, total_len - offset, MAX_NETWORK_BUFFER-1)
 
             # Current sequence number
             seq_no = self.window["next_seq_to_send"]
             chunk = data[offset : offset + payload_len]
 
             # Create a packet, always have an ack in TCP after initial SYN
-            segment = Packet(seq=seq_no, ack=self.window["last_ack"], payload=chunk)
+            segment = Packet(seq=seq_no, ack=self.window["last_ack"], payload=chunk, window_size=self.get_window())
 
             # We expect an ACK for seq_no + payload_len
             ack_goal = seq_no + payload_len
 
             retries = 0
             while True:
+                while payload_len > self.window["peer_window"]:
+                    time.sleep(0.1)
+                 
                 print(f"[SENT] packet (seq={seq_no}, ack={self.window["last_ack"]}, len={payload_len})")
                 self.sock_fd.sendto(segment.encode(), self.conn)
                 time.sleep(0.1)
@@ -283,6 +291,7 @@ class TransportSocket:
 
                 data, addr = self.sock_fd.recvfrom(2048)
                 packet = Packet.decode(data)
+                self.window["peer_window"] = packet.window_size
 
                 # If no peer is set, establish connection (for listener)
                 if self.conn is None:
@@ -301,9 +310,6 @@ class TransportSocket:
                             
                             self.ack_packet(packet, SYN_FLAG + ACK_FLAG, addr)
                             
-                            
-                            
-
                             continue
                         
                     case "SYN_SENT":
@@ -313,7 +319,7 @@ class TransportSocket:
                             self.update_ack(packet)
                             self.window["last_ack"] += len(packet.payload)
 
-                            ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG)
+                            ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG, window_size=self.get_window())
                             self.sock_fd.sendto(ack_packet.encode(), addr)
 
                             print(f"[ACKING] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
@@ -364,7 +370,6 @@ class TransportSocket:
                             # Log the received data
                             self.ack_packet(packet, ACK_FLAG, addr)
                             
-
                             continue
 
                         else:
@@ -448,7 +453,7 @@ class TransportSocket:
     def ack_packet(self, packet, flags, addr):
         # Send back an acknowledgment
         ack_val = packet.seq + len(packet.payload)
-        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags)
+        ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, window_size=self.get_window())
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
         self.window["last_ack"] = ack_val
@@ -465,5 +470,7 @@ class TransportSocket:
         print(f"[{kind}] (seq={ack_packet.seq}, ack={self.window["last_ack"]})")
 
 
-    
+    def get_window(self):
+        window = MAX_NETWORK_BUFFER - self.window["recv_len"]
+        return 0 if window<0 else window
 
