@@ -207,6 +207,7 @@ class TransportSocket:
             self.sock_fd.sendto(syn_packet.encode(), self.conn)
             
             if self.wait_for_ack(syn_packet.seq):
+                self.window["next_seq_to_send"] +=1
                 break
             else:
                 retries += 1
@@ -252,7 +253,7 @@ class TransportSocket:
                 time.sleep(0.1)
                 if self.wait_for_ack(ack_goal):
                     # Advance our next_seq_to_send
-                    self.window["next_seq_to_send"] += payload_len
+                    self.window["next_seq_to_send"] += payload_len + 1
                     break
                 else:
                     retries += 1
@@ -330,7 +331,7 @@ class TransportSocket:
                         if packet.flags & (SYN_FLAG + ACK_FLAG) != 0:
                             print(f"[SYN-ACK] received (seq={packet.seq}, ack={packet.ack})")
                             self.update_ack(packet)
-                            self.window["last_ack"] += len(packet.payload)
+                            self.window["last_ack"] += len(packet.payload) + 1
 
                             ack_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = ACK_FLAG, window_size=self.get_window(), timestamp=time.time())
                             self.sock_fd.sendto(ack_packet.encode(), addr)
@@ -479,7 +480,7 @@ class TransportSocket:
     
     def ack_packet(self, packet, flags, addr):
         # Send back an acknowledgment
-        ack_val = packet.seq + len(packet.payload)
+        ack_val = packet.seq + len(packet.payload) + 1
         ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, window_size=self.get_window(), timestamp = packet.timestamp)
         self.sock_fd.sendto(ack_packet.encode(), addr)
         # Update last_ack
@@ -491,6 +492,7 @@ class TransportSocket:
 
         elif flags & SYN_FLAG != 0:
             kind = "ACKING SYN"
+            self.window["next_seq_to_send"] +=1
         else:
             kind = "ACKING"
             
