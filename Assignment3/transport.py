@@ -2,7 +2,7 @@ import socket
 import struct
 import threading
 import time  
-from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER, WINDOW_INITIAL_WINDOW_SIZE, WINDOW_INITIAL_SSTHRESH
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -70,14 +70,15 @@ class TransportSocket:
         self.conn = None
         self.my_port = None
 
-        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
-        self.ssthresh = WINDOW_INITIAL_SSTHRESH
+        
         self.closing_time = None
         self.alpha = 0.85
         self.estimate = 1
         self.timeout = 2 * self.estimate
         self.duplicate_acks = 0
         self.duplicate_pkt = None
+        
+        self.packets = [] # Dict to store the frames we've sent.         [{ack: timeout: packet:}]
 
         
 
@@ -120,19 +121,18 @@ class TransportSocket:
         fin_packet = Packet(seq = self.window["next_seq_to_send"], ack = self.window["last_ack"], flags = FIN_FLAG, window_size=self.get_window(), timestamp=time.time())
         print(fin_packet.window_size)
         # If the peer is waiting on us to finish, go into LAST_ACK instead
-        if self.window["status"] not in ("CLOSED", "TIME_WAIT", "CLOSE_WAIT"):
-            if self.window["status"] in ("ESTABLISHED", "SYN_RCVD"):
-                self.window["status"] = "FIN_SENT" 
-            else:
-                self.window["status"] = "LAST_ACK" 
-        
-            self.sock_fd.sendto(fin_packet.encode(), self.conn)
-            print(f"[FIN] (seq={fin_packet.seq}, ack={fin_packet.ack})")
-            self.window["next_seq_to_send"] += len(fin_packet.payload)
+        if self.window["status"] == "ESTABLISHED" or self.window["status"] == "SYN_RCVD":
+            self.window["status"] = "FIN_SENT" 
+        else:
+            self.window["status"] = "LAST_ACK" 
 
-            with self.death_cond:
-                if self.dying == False:
-                    self.death_cond.wait()
+        self.sock_fd.sendto(fin_packet.encode(), self.conn)
+        print(f"[FIN] (seq={fin_packet.seq}, ack={fin_packet.ack})")
+        self.window["next_seq_to_send"] += len(fin_packet.payload)
+
+        with self.death_cond:
+            if self.dying == False:
+                self.death_cond.wait()
 
         if self.thread:
             self.thread.join()
@@ -194,6 +194,7 @@ class TransportSocket:
                 read_len = EXIT_ERROR
         finally:
             self.recv_lock.release()
+
         return read_len
     
     def send_syn(self):
@@ -243,15 +244,19 @@ class TransportSocket:
             # We expect an ACK for seq_no + payload_len
             ack_goal = seq_no + payload_len
 
-            
+            if payload_len > self.window["peer_window"]:
+                                                                                                                                self.window["peer_window"] += 10
+
             retries = 0
             while True:
-                if payload_len > self.window["peer_window"]:
-                    time.sleep(0.1)
-                    continue
                  
                 print(f"[SENT] packet (seq={seq_no}, ack={self.window["last_ack"]}, len={payload_len})")
                 self.sock_fd.sendto(segment.encode(), self.conn)
+                self.packets.append({
+                    "ack": seq_no + payload_len + 1, 
+                    "timeout": time.time() + self.timeout,
+                    "packet": segment    
+                })
                 time.sleep(0.1)
                 if self.wait_for_ack(ack_goal):
                     # Advance our next_seq_to_send
@@ -304,9 +309,9 @@ class TransportSocket:
 
                 data, addr = self.sock_fd.recvfrom(2048)
                 packet = Packet.decode(data)
-                self.window["peer_window"] = min(self.cwnd, packet.window_size)
+                self.window["peer_window"] = packet.window_size
                 
-                # Reset our time if we get a new packet
+
                 
 
                 # If no peer is set, establish connection (for listener)
@@ -485,8 +490,11 @@ class TransportSocket:
         ack_val = packet.seq + len(packet.payload) + 1
         ack_packet = Packet(seq=self.window["next_seq_to_send"], ack=ack_val, flags=flags, window_size=self.get_window(), timestamp = packet.timestamp)
         self.sock_fd.sendto(ack_packet.encode(), addr)
+        
         # Update last_ack
         self.window["last_ack"] = ack_val
+
+        # Update list of packets received
 
         kind = ""
         if flags & FIN_FLAG !=0: 
